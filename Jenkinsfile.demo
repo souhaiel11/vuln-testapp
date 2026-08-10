@@ -1,0 +1,49 @@
+// ============================================================================
+// GROUPE C — JENKINSFILE A OPTIMISER PAR WF4 (Jenkinsfile Optimizer)
+// ============================================================================
+// ATTENTION : ce fichier n'est PAS le pipeline reel qui tourne (voir
+// Jenkinsfile). C'est un fichier VOLONTAIREMENT NON OPTIMISE, destine a etre
+// soumis a WF4 via le bouton "Optimiser le Jenkinsfile" de la plateforme.
+//
+// Il viole plusieurs bonnes pratiques que WF4 sait corriger :
+//  - pas de timeout()      -> WF4 doit ajouter un timeout global
+//  - pas de retry()        -> WF4 doit ajouter retry sur les etapes reseau
+//  - pas de cleanWs()      -> WF4 doit ajouter le nettoyage du workspace
+//  - credentials en clair  -> WF4 doit passer par withCredentials()
+//  - pas d'options{}       -> WF4 doit ajouter les options recommandees
+// ============================================================================
+
+pipeline {
+    agent any
+
+    environment {
+        // Mauvaise pratique : credential en clair dans l'environnement.
+        DOCKER_PASSWORD = "dckr_pat_1234567890abcdef"
+        SONAR_TOKEN = "sqp_hardcoded_token_do_not_do_this"
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh 'mvn -B clean package -DskipTests'
+            }
+        }
+
+        stage('Sonar') {
+            steps {
+                // Etape reseau sans retry ni timeout.
+                sh 'mvn sonar:sonar -Dsonar.login=${SONAR_TOKEN}'
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                // Credential en clair dans la commande.
+                sh 'docker login -u admin -p ${DOCKER_PASSWORD}'
+                sh 'docker push vuln-testapp:latest'
+            }
+        }
+    }
+
+    // Pas de post{} avec cleanWs() -> workspace jamais nettoye.
+}
