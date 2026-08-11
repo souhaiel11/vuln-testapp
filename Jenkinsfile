@@ -245,7 +245,7 @@ pipeline {
         def buildStatus = currentBuild.currentResult
         def event = buildStatus == 'SUCCESS' ? 'pipeline_success' : buildStatus == 'UNSTABLE' ? 'pipeline_unstable' : 'pipeline_failed'
         def severity = buildStatus == 'FAILURE' ? 'HIGH' : buildStatus == 'UNSTABLE' ? 'MEDIUM' : 'LOW'
-        withCredentials([string(credentialsId: 'n8n-api-key', variable: 'N8N_API_KEY')]) {
+        withCredentials([string(credentialsId: 'N8N_API_KEY', variable: 'N8N_API_KEY')]) {
           try {
             def payloadMap = [
               event: event,
