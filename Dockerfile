@@ -4,9 +4,18 @@
 # DF-SEC-USER      : pas de USER (execution en root)
 # DF-SEC-HEALTHCHECK : pas de HEALTHCHECK
 
-FROM openjdk:8-jdk
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /app
+COPY pom.xml .
+COPY src/ src/
+RUN mvn package -DskipTests
+
+FROM eclipse-temurin:21-jre-jammy
 
 WORKDIR /app
-COPY target/vuln-testapp-1.0.0.jar app.jar
+COPY --from=build /app/target/*.jar app.jar
 EXPOSE 8080
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD curl -f http://localhost:8080/actuator/health || exit 1
 ENTRYPOINT ["java", "-jar", "app.jar"]
