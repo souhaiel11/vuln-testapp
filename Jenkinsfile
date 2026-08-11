@@ -4,7 +4,6 @@ pipeline {
 
   options {
     timeout(time: 60, unit: 'MINUTES')
-    timestamps()
     buildDiscarder(logRotator(numToKeepStr: '10'))
   }
 
@@ -16,6 +15,28 @@ pipeline {
     N8N_WEBHOOK       = 'http://n8n:5678/webhook/jenkins-event'
     BACKEND_URL       = 'http://172.31.172.61:3001'
     DOCKER_NETWORK    = 'pfe-network'
+    COMPILE_STATUS        = 'UNKNOWN'
+    SONAR_STATUS          = 'UNKNOWN'
+    QUALITY_GATE_STATUS   = 'UNKNOWN'
+    SONAR_BUGS            = '0'
+    SONAR_VULNS           = '0'
+    SONAR_SMELLS          = '0'
+    SONAR_COVERAGE        = '0'
+    SONAR_DUPLICATIONS    = '0'
+    OWASP_STATUS          = 'UNKNOWN'
+    OWASP_CRITICAL        = '0'
+    OWASP_HIGH            = '0'
+    OWASP_ERROR           = ''
+    TRIVY_STATUS          = 'UNKNOWN'
+    TRIVY_CRITICAL        = '0'
+    TRIVY_HIGH            = '0'
+    TRIVY_ERROR           = ''
+    ZAP_STATUS            = 'UNKNOWN'
+    ZAP_ALERTS_HIGH       = '0'
+    ZAP_ALERTS_MEDIUM     = '0'
+    ZAP_ALERTS_LOW        = '0'
+    ZAP_ERROR             = ''
+    DOCKER_BUILD_STATUS   = 'UNKNOWN'
   }
 
   stages {
@@ -24,25 +45,12 @@ pipeline {
       steps {
         script {
           env.BUILD_VERSION = "${env.BUILD_NUMBER}"
-          env.COMPILE_STATUS = 'UNKNOWN'
-          env.SONAR_STATUS = 'UNKNOWN'
-          env.QUALITY_GATE_STATUS = 'UNKNOWN'
-          env.SONAR_BUGS = '0'; env.SONAR_VULNS = '0'
-          env.SONAR_SMELLS = '0'; env.SONAR_COVERAGE = '0'
-          env.SONAR_DUPLICATIONS = '0'
-          env.OWASP_STATUS = 'UNKNOWN'; env.OWASP_CRITICAL = '0'
-          env.OWASP_HIGH = '0'; env.OWASP_ERROR = ''
-          env.TRIVY_STATUS = 'UNKNOWN'; env.TRIVY_CRITICAL = '0'
-          env.TRIVY_HIGH = '0'; env.TRIVY_ERROR = ''
-          env.ZAP_STATUS = 'UNKNOWN'; env.ZAP_ALERTS_HIGH = '0'
-          env.ZAP_ALERTS_MEDIUM = '0'; env.ZAP_ALERTS_LOW = '0'
-          env.ZAP_ERROR = ''; env.DOCKER_BUILD_STATUS = 'UNKNOWN'
         }
       }
     }
 
     stage('Build') {
-      steps { sh 'mvn clean package -DskipTests -q' }
+      steps { sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
       post {
         success { script { env.COMPILE_STATUS = 'SUCCESS' } }
         failure { script { env.COMPILE_STATUS = 'FAILED' } }
@@ -54,11 +62,14 @@ pipeline {
       steps {
         withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
           withSonarQubeEnv('sq1') {
-            sh """
-              mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \\
-              -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \\
-              -Dsonar.projectVersion=${env.BUILD_VERSION}
-            """
+            retry(2) {
+              sh """
+                mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \\
+                -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \\
+                -Dsonar.projectVersion=${env.BUILD_VERSION} \\
+                -Dmaven.repo.local=/var/jenkins_home/.m2/repository
+              """
+            }
           }
         }
         script { env.SONAR_STATUS = 'SUCCESS' }
@@ -102,16 +113,22 @@ pipeline {
       parallel {
 
         stage('SCA - OWASP') {
-          options { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') }
+          options {
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE')
+            timeout(time: 30, unit: 'MINUTES')
+          }
           steps {
             withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
               script {
-                def result = sh(script: '''
-                  mvn org.owasp:dependency-check-maven:check \
-                    -DfailBuildOnCVSS=7 \
-                    "-DnvdApiKey=$NVD_API_KEY" \
-                    -Dformats=HTML,JSON 2>&1 || true
-                ''', returnStdout: true).trim()
+                def result = retry(2) {
+                  sh(script: '''
+                    mvn org.owasp:dependency-check-maven:check \
+                      -DfailBuildOnCVSS=7 \
+                      "-DnvdApiKey=$NVD_API_KEY" \
+                      -Dformats=HTML,JSON \
+                      -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
+                  ''', returnStdout: true).trim()
+                }
                 if (result.contains('BUILD SUCCESS')) {
                   env.OWASP_STATUS = 'SUCCESS'
                   try {
@@ -133,16 +150,21 @@ pipeline {
         }
 
         stage('Docker Build & Trivy') {
-          options { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') }
+          options {
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE')
+            timeout(time: 15, unit: 'MINUTES')
+          }
           steps {
             script {
-              sh "docker build -t ${DOCKER_IMAGE}:latest ."
+              sh "docker build -t ${DOCKER_IMAGE}:${BUILD_NUMBER} ."
               env.DOCKER_BUILD_STATUS = 'SUCCESS'
-              sh """
-                trivy image --exit-code 0 --severity CRITICAL,HIGH \\
-                  --format json --output ${WORKSPACE}/trivy-report.json \\
-                  ${DOCKER_IMAGE}:latest 2>&1 || true
-              """
+              retry(2) {
+                sh """
+                  trivy image --exit-code 0 --severity CRITICAL,HIGH \\
+                    --format json --output ${WORKSPACE}/trivy-report.json \\
+                    ${DOCKER_IMAGE}:${BUILD_NUMBER} 2>&1 || true
+                """
+              }
               try {
                 def report = new groovy.json.JsonSlurper().parseText(readFile("${env.WORKSPACE}/trivy-report.json"))
                 def critical = 0; def high = 0
@@ -161,11 +183,14 @@ pipeline {
     }
 
     stage('DAST - ZAP') {
-      options { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') }
+      options {
+        catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE')
+        timeout(time: 20, unit: 'MINUTES')
+      }
       steps {
         script {
           sh "mkdir -p ${WORKSPACE}/security/zap"
-          sh "docker run -d --name vuln-testapp-zap --network ${DOCKER_NETWORK} ${DOCKER_IMAGE}:latest"
+          sh "docker run -d --name vuln-testapp-zap --network ${DOCKER_NETWORK} ${DOCKER_IMAGE}:${BUILD_NUMBER}"
           sh '''
             echo "Attente du demarrage du conteneur applicatif..."
             for i in $(seq 1 12); do
@@ -183,7 +208,6 @@ pipeline {
             docker run --rm \\
               --network ${DOCKER_NETWORK} \\
               -v ${WORKSPACE}/security/zap:/zap/wrk:rw \\
-              --user root \\
               ghcr.io/zaproxy/zaproxy:2.15.0 \\
               zap-baseline.py \\
               -t http://vuln-testapp-zap:8080 \\
@@ -223,31 +247,56 @@ pipeline {
         def severity = buildStatus == 'FAILURE' ? 'HIGH' : buildStatus == 'UNSTABLE' ? 'MEDIUM' : 'LOW'
         withCredentials([string(credentialsId: 'n8n-api-key', variable: 'N8N_API_KEY')]) {
           try {
-            def payload = """{
-              "event":"${event}","project_id":"${env.PROJECT_ID}",
-              "job":"${env.JOB_NAME}","build_number":"${env.BUILD_NUMBER}",
-              "build_url":"${env.BUILD_URL}","status":"${buildStatus}",
-              "severity":"${severity}","duration_ms":${currentBuild.duration},
-              "sonar":{"status":"${env.SONAR_STATUS}","quality_gate":"${env.QUALITY_GATE_STATUS}",
-                "project_key":"${env.SONAR_PROJECT_KEY}","bugs":${env.SONAR_BUGS},
-                "vulnerabilities":${env.SONAR_VULNS},"code_smells":${env.SONAR_SMELLS},
-                "coverage":"${env.SONAR_COVERAGE}","duplications":"${env.SONAR_DUPLICATIONS}",
-                "dashboard_url":"http://172.31.172.61:9000/dashboard?id=${env.SONAR_PROJECT_KEY}",
-                "api_url":"http://sonarqube:9000/api/measures/component?component=${env.SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density"},
-              "trivy":{"status":"${env.TRIVY_STATUS}","critical":${env.TRIVY_CRITICAL},
-                "high":${env.TRIVY_HIGH},"error":"${env.TRIVY_ERROR}","image_tag":"latest",
-                "report_url":"${env.BUILD_URL}artifact/trivy-report.json"},
-              "owasp":{"status":"${env.OWASP_STATUS}","error":"${env.OWASP_ERROR}",
-                "critical":${env.OWASP_CRITICAL},"high":${env.OWASP_HIGH},
-                "report_url":"${env.BUILD_URL}artifact/target/dependency-check-report.json"},
-              "zap":{"status":"${env.ZAP_STATUS}","error":"${env.ZAP_ERROR}",
-                "alerts_high":${env.ZAP_ALERTS_HIGH},"alerts_medium":${env.ZAP_ALERTS_MEDIUM},
-                "alerts_low":${env.ZAP_ALERTS_LOW},
-                "report_url":"${env.BUILD_URL}artifact/security/zap/zap-report.json"},
-              "tests":{"status":"SKIPPED","total":0,"failures":0},
-              "docker":{"build_status":"${env.DOCKER_BUILD_STATUS}","push_status":"SKIPPED"},
-              "deploy":{"status":"SKIPPED"},"nexus":{"status":"SKIPPED"}
-            }"""
+            def payloadMap = [
+              event: event,
+              project_id: env.PROJECT_ID,
+              job: env.JOB_NAME,
+              build_number: env.BUILD_NUMBER,
+              build_url: env.BUILD_URL,
+              status: buildStatus,
+              severity: severity,
+              duration_ms: currentBuild.duration,
+              sonar: [
+                status: env.SONAR_STATUS,
+                quality_gate: env.QUALITY_GATE_STATUS,
+                project_key: env.SONAR_PROJECT_KEY,
+                bugs: env.SONAR_BUGS,
+                vulnerabilities: env.SONAR_VULNS,
+                code_smells: env.SONAR_SMELLS,
+                coverage: env.SONAR_COVERAGE,
+                duplications: env.SONAR_DUPLICATIONS,
+                dashboard_url: "http://172.31.172.61:9000/dashboard?id=${env.SONAR_PROJECT_KEY}",
+                api_url: "http://sonarqube:9000/api/measures/component?component=${env.SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density"
+              ],
+              trivy: [
+                status: env.TRIVY_STATUS,
+                critical: env.TRIVY_CRITICAL,
+                high: env.TRIVY_HIGH,
+                error: env.TRIVY_ERROR,
+                image_tag: env.BUILD_NUMBER,
+                report_url: "${env.BUILD_URL}artifact/trivy-report.json"
+              ],
+              owasp: [
+                status: env.OWASP_STATUS,
+                error: env.OWASP_ERROR,
+                critical: env.OWASP_CRITICAL,
+                high: env.OWASP_HIGH,
+                report_url: "${env.BUILD_URL}artifact/target/dependency-check-report.json"
+              ],
+              zap: [
+                status: env.ZAP_STATUS,
+                error: env.ZAP_ERROR,
+                alerts_high: env.ZAP_ALERTS_HIGH,
+                alerts_medium: env.ZAP_ALERTS_MEDIUM,
+                alerts_low: env.ZAP_ALERTS_LOW,
+                report_url: "${env.BUILD_URL}artifact/security/zap/zap-report.json"
+              ],
+              tests: [status: 'SKIPPED', total: 0, failures: 0],
+              docker: [build_status: env.DOCKER_BUILD_STATUS, push_status: 'SKIPPED'],
+              deploy: [status: 'SKIPPED'],
+              nexus: [status: 'SKIPPED']
+            ]
+            def payload = groovy.json.JsonOutput.toJson(payloadMap)
             httpRequest(url: env.N8N_WEBHOOK, httpMode: 'POST',
               contentType: 'APPLICATION_JSON', requestBody: payload,
               customHeaders: [[name: 'X-API-Key', value: N8N_API_KEY]],
@@ -256,14 +305,22 @@ pipeline {
           } catch(Exception e) { echo "n8n failed: ${e.message}" }
         }
         try {
-          withCredentials([string(credentialsId: 'docker-password', variable: 'DOCKER_PASSWORD')]) {
-            httpRequest(
-              url: "${env.BACKEND_URL}/api/webhooks/jenkins/${env.PROJECT_ID}",
-              httpMode: 'POST', contentType: 'APPLICATION_JSON',
-              requestBody: """{"name":"${env.JOB_NAME}","build":{"phase":"FINALIZED","status":"${buildStatus}","number":"${env.BUILD_NUMBER}","url":"${env.BUILD_URL}"}}""",
-              ignoreSslErrors: true, validResponseCodes: '100:599')
-            echo "Backend notifie"
-          }
+          def backendPayloadMap = [
+            name: env.JOB_NAME,
+            build: [
+              phase: 'FINALIZED',
+              status: buildStatus,
+              number: env.BUILD_NUMBER,
+              url: env.BUILD_URL
+            ]
+          ]
+          def backendPayload = groovy.json.JsonOutput.toJson(backendPayloadMap)
+          httpRequest(
+            url: "${env.BACKEND_URL}/api/webhooks/jenkins/${env.PROJECT_ID}",
+            httpMode: 'POST', contentType: 'APPLICATION_JSON',
+            requestBody: backendPayload,
+            ignoreSslErrors: true, validResponseCodes: '100:599')
+          echo "Backend notifie"
         } catch(Exception e) { echo "Backend failed: ${e.message}" }
       }
       cleanWs()
