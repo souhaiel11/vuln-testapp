@@ -45,16 +45,23 @@ pipeline {
   stages {
 
     stage('Build Info') {
+      options { timeout(time: 2, unit: 'MINUTES') }
       steps {
         script {
-          sh 'chmod +x mvnw'
+          // BUILD_VERSION est distinct de BUILD_NUMBER pour permettre l'ajout futur d'un suffixe
+          // (ex: snapshot, release candidate) sans modifier la logique de numerotation Jenkins.
           env.BUILD_VERSION = "${env.BUILD_NUMBER}"
         }
       }
     }
 
     stage('Build') {
-      steps { sh './mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
+      options { timeout(time: 10, unit: 'MINUTES') }
+      steps {
+        retry(2) {
+          sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+        }
+      }
       post {
         success {
           script { env.COMPILE_STATUS = 'SUCCESS' }
@@ -71,7 +78,7 @@ pipeline {
           withSonarQubeEnv('sq1') {
             retry(2) {
               sh '''
-                ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+                mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
                 -Dsonar.projectKey=$SONAR_PROJECT_KEY \
                 -Dsonar.projectVersion=$BUILD_VERSION \
                 -Dmaven.repo.local=/var/jenkins_home/.m2/repository
@@ -140,7 +147,7 @@ pipeline {
               script {
                 def result = retry(2) {
                   sh(script: '''
-                    ./mvnw org.owasp:dependency-check-maven:check \
+                    mvn org.owasp:dependency-check-maven:check \
                       -DfailBuildOnCVSS=7 \
                       "-DnvdApiKey=$NVD_API_KEY" \
                       -Dformats=HTML,JSON \
@@ -176,10 +183,13 @@ pipeline {
             script {
               sh 'docker build -t $DOCKER_IMAGE:$BUILD_NUMBER .'
               env.DOCKER_BUILD_STATUS = 'SUCCESS'
+              // JF-7 : tracer la version de Trivy utilisee sur l'agent pour la reproductibilite des analyses
+              sh 'trivy --version'
               retry(2) {
                 sh '''
                   trivy image --exit-code 0 --severity CRITICAL,HIGH \
-                    --format json --output $WORKSPACE/trivy-report.json \
+                    --format json --output ${WORKSPACE}/trivy-report.json \
+                    --format table --output ${WORKSPACE}/trivy-report.txt \
                     $DOCKER_IMAGE:$BUILD_NUMBER 2>&1 || true
                 '''
               }
@@ -196,8 +206,7 @@ pipeline {
           }
           post {
             always {
-              archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
-              sh 'docker rmi $DOCKER_IMAGE:$BUILD_NUMBER || true'
+              archiveArtifacts artifacts: 'trivy-report.json, trivy-report.txt', allowEmptyArchive: true
             }
           }
         }
@@ -212,10 +221,13 @@ pipeline {
       }
       steps {
         script {
+          // Les variables ${WORKSPACE}, ${DOCKER_NETWORK}, ${DOCKER_IMAGE}, ${BUILD_NUMBER}
+          // sont expansees par le shell (guillemets simples) et non par Groovy,
+          // garantissant que les valeurs d'environnement Jenkins sont correctement resolues.
           sh '''
-            mkdir -p $WORKSPACE/security/zap
+            mkdir -p ${WORKSPACE}/security/zap
             docker rm -f vuln-testapp-zap || true
-            docker run -d --name vuln-testapp-zap --network $DOCKER_NETWORK $DOCKER_IMAGE:$BUILD_NUMBER
+            docker run -d --name vuln-testapp-zap --network ${DOCKER_NETWORK} ${DOCKER_IMAGE}:${BUILD_NUMBER}
           '''
           sh '''
             echo "Attente du demarrage du conteneur applicatif..."
@@ -233,8 +245,8 @@ pipeline {
           retry(2) {
             sh '''
               docker run --rm \
-                --network $DOCKER_NETWORK \
-                -v $WORKSPACE/security/zap:/zap/wrk:rw \
+                --network ${DOCKER_NETWORK} \
+                -v ${WORKSPACE}/security/zap:/zap/wrk:rw \
                 ghcr.io/zaproxy/zaproxy:2.15.0 \
                 zap-baseline.py \
                 -t http://vuln-testapp-zap:8080 \
@@ -261,6 +273,8 @@ pipeline {
       post {
         always {
           sh 'docker rm -f vuln-testapp-zap || true'
+          // Suppression de l'image Docker apres que ZAP ait termine son analyse
+          sh 'docker rmi $DOCKER_IMAGE:$BUILD_NUMBER || true'
           archiveArtifacts artifacts: 'security/zap/zap-report.json, security/zap/zap-report.html', allowEmptyArchive: true
         }
       }
@@ -273,6 +287,9 @@ pipeline {
         def buildStatus = currentBuild.currentResult
         def event = buildStatus == 'SUCCESS' ? 'pipeline_success' : buildStatus == 'UNSTABLE' ? 'pipeline_unstable' : 'pipeline_failed'
         def severity = buildStatus == 'FAILURE' ? 'HIGH' : buildStatus == 'UNSTABLE' ? 'MEDIUM' : 'LOW'
+        // JF-6 : La cle API n8n est transmise via withCredentials (masquage automatique dans les logs Jenkins).
+        // Le plugin HTTP Request ne doit pas etre configure en mode debug en production
+        // afin d'eviter toute exposition des headers dans les logs.
         withCredentials([string(credentialsId: 'N8N_API_KEY', variable: 'N8N_API_KEY')]) {
           try {
             def payloadMap = [
@@ -352,6 +369,9 @@ pipeline {
         } catch(Exception e) { echo "Backend failed: ${e.message}" }
       }
       cleanWs()
+    }
+    failure {
+      echo 'Pipeline en echec - voir les logs et les rapports archives'
     }
   }
 }
