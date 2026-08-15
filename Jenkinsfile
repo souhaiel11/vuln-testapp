@@ -333,6 +333,31 @@ pipeline {
           } catch(Exception e) { echo "n8n failed: ${e.message}" }
         }
         try {
+          // Reutilise les memes variables deja calculees pour le payload n8n
+          // ci-dessus (COMPILE_STATUS, SONAR_STATUS, OWASP_STATUS/ERROR,
+          // DOCKER_BUILD_STATUS/TRIVY_ERROR, ZAP_STATUS/ERROR) - rien de
+          // recalcule. Premier stage dont le statut n'est pas 'SUCCESS' =
+          // le stage en cause (les valeurs par defaut sont 'UNKNOWN', donc
+          // un stage jamais atteint a cause d'un exit anterieur est aussi
+          // correctement detecte, pas seulement les 'FAILED' explicites).
+          def failedStage = null
+          def errorMessage = null
+          if (buildStatus != 'SUCCESS') {
+            def stageChecks = [
+              ['Build',                env.COMPILE_STATUS,      null],
+              ['SAST - SonarQube',     env.SONAR_STATUS,        null],
+              ['SCA - OWASP',          env.OWASP_STATUS,        env.OWASP_ERROR],
+              ['Docker Build & Trivy', env.DOCKER_BUILD_STATUS, env.TRIVY_ERROR],
+              ['DAST - ZAP',           env.ZAP_STATUS,          env.ZAP_ERROR],
+            ]
+            for (chk in stageChecks) {
+              if (chk[1] != 'SUCCESS') {
+                failedStage = chk[0]
+                errorMessage = chk[2] ?: "${chk[0]} a echoue (voir logs Jenkins : ${env.BUILD_URL}console)."
+                break
+              }
+            }
+          }
           def backendPayloadMap = [
             name: env.JOB_NAME,
             build: [
@@ -340,6 +365,15 @@ pipeline {
               status: buildStatus,
               number: env.BUILD_NUMBER,
               url: env.BUILD_URL
+            ],
+            failed_stage: failedStage,
+            error_message: errorMessage,
+            tools: [
+              sonar:  [status: env.SONAR_STATUS,       quality_gate: env.QUALITY_GATE_STATUS],
+              owasp:  [status: env.OWASP_STATUS,        error: env.OWASP_ERROR],
+              trivy:  [status: env.TRIVY_STATUS,        error: env.TRIVY_ERROR],
+              docker: [status: env.DOCKER_BUILD_STATUS],
+              zap:    [status: env.ZAP_STATUS,          error: env.ZAP_ERROR],
             ]
           ]
           def backendPayload = groovy.json.JsonOutput.toJson(backendPayloadMap)
