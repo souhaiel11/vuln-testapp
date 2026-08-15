@@ -3,7 +3,6 @@ pipeline {
   tools { maven 'M3' }
 
   options {
-    timestamps()
     timeout(time: 60, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '10'))
   }
@@ -45,28 +44,24 @@ pipeline {
   stages {
 
     stage('Build Info') {
-      options { timeout(time: 2, unit: 'MINUTES') }
       steps {
-        script {
-          // BUILD_VERSION est distinct de BUILD_NUMBER pour permettre l'ajout futur d'un suffixe
-          // (ex: snapshot, release candidate) sans modifier la logique de numerotation Jenkins.
-          env.BUILD_VERSION = "${env.BUILD_NUMBER}"
+        timestamps {
+          script {
+            sh 'chmod +x mvnw'
+            env.BUILD_VERSION = "${env.BUILD_NUMBER}"
+          }
         }
       }
     }
 
     stage('Build') {
-      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
-        retry(2) {
-          sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+        timestamps {
+          sh './mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
         }
       }
       post {
-        success {
-          script { env.COMPILE_STATUS = 'SUCCESS' }
-          archiveArtifacts artifacts: 'target/vuln-testapp-1.0.0.jar', allowEmptyArchive: true
-        }
+        success { script { env.COMPILE_STATUS = 'SUCCESS' } }
         failure { script { env.COMPILE_STATUS = 'FAILED' } }
       }
     }
@@ -74,19 +69,21 @@ pipeline {
     stage('SAST - SonarQube') {
       options { catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') }
       steps {
-        withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-          withSonarQubeEnv('sq1') {
-            retry(2) {
-              sh '''
-                mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
-                -Dsonar.projectKey=$SONAR_PROJECT_KEY \
-                -Dsonar.projectVersion=$BUILD_VERSION \
-                -Dmaven.repo.local=/var/jenkins_home/.m2/repository
-              '''
+        timestamps {
+          withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+            withSonarQubeEnv('sq1') {
+              retry(2) {
+                sh '''
+                  ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+                  -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+                  -Dsonar.projectVersion=$BUILD_VERSION \
+                  -Dmaven.repo.local=/var/jenkins_home/.m2/repository
+                '''
+              }
             }
           }
+          script { env.SONAR_STATUS = 'SUCCESS' }
         }
-        script { env.SONAR_STATUS = 'SUCCESS' }
       }
       post { failure { script { env.SONAR_STATUS = 'FAILED' } } }
     }
@@ -97,38 +94,36 @@ pipeline {
         timeout(time: 5, unit: 'MINUTES')
       }
       steps {
-        script {
-          withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
-            try {
-              // Recuperation du statut du Quality Gate via l'API SonarQube (sans dependance au webhook)
-              def qgResponse = retry(2) {
-                sh(script: '''
-                  curl -s --max-time 30 -u "$SONAR_TOKEN": \
+        timestamps {
+          script {
+            withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+              try {
+                // Recuperation du statut du Quality Gate via l'API SonarQube (sans dependance au webhook)
+                def qgResponse = sh(script: '''
+                  curl -s -u "$SONAR_TOKEN": \
                   "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" \
                   2>/dev/null || echo '{}'
                 ''', returnStdout: true).trim()
-              }
-              def qgJson = new groovy.json.JsonSlurper().parseText(qgResponse)
-              env.QUALITY_GATE_STATUS = qgJson?.projectStatus?.status ?: 'UNKNOWN'
+                def qgJson = new groovy.json.JsonSlurper().parseText(qgResponse)
+                env.QUALITY_GATE_STATUS = qgJson?.projectStatus?.status ?: 'UNKNOWN'
 
-              def sonarMetrics = retry(2) {
-                sh(script: '''
-                  curl -s --max-time 30 -u "$SONAR_TOKEN": \
+                def sonarMetrics = sh(script: '''
+                  curl -s -u "$SONAR_TOKEN": \
                   "$SONAR_HOST_URL/api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
                   2>/dev/null || echo '{}'
                 ''', returnStdout: true).trim()
-              }
-              def metrics = new groovy.json.JsonSlurper().parseText(sonarMetrics)
-              metrics.component?.measures?.each { m ->
-                switch(m.metric) {
-                  case 'bugs':                     env.SONAR_BUGS         = m.value ?: '0'; break
-                  case 'vulnerabilities':          env.SONAR_VULNS        = m.value ?: '0'; break
-                  case 'code_smells':              env.SONAR_SMELLS       = m.value ?: '0'; break
-                  case 'coverage':                 env.SONAR_COVERAGE     = m.value ?: '0'; break
-                  case 'duplicated_lines_density': env.SONAR_DUPLICATIONS = m.value ?: '0'; break
+                def metrics = new groovy.json.JsonSlurper().parseText(sonarMetrics)
+                metrics.component?.measures?.each { m ->
+                  switch(m.metric) {
+                    case 'bugs':                     env.SONAR_BUGS         = m.value ?: '0'; break
+                    case 'vulnerabilities':          env.SONAR_VULNS        = m.value ?: '0'; break
+                    case 'code_smells':              env.SONAR_SMELLS       = m.value ?: '0'; break
+                    case 'coverage':                 env.SONAR_COVERAGE     = m.value ?: '0'; break
+                    case 'duplicated_lines_density': env.SONAR_DUPLICATIONS = m.value ?: '0'; break
+                  }
                 }
-              }
-            } catch(e) { echo "SonarQube quality gate/metrics failed: ${e.message}" }
+              } catch(e) { echo "SonarQube quality gate/metrics failed: ${e.message}" }
+            }
           }
         }
       }
@@ -143,30 +138,32 @@ pipeline {
             timeout(time: 30, unit: 'MINUTES')
           }
           steps {
-            withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
-              script {
-                def result = retry(2) {
-                  sh(script: '''
-                    mvn org.owasp:dependency-check-maven:check \
-                      -DfailBuildOnCVSS=7 \
-                      "-DnvdApiKey=$NVD_API_KEY" \
-                      -Dformats=HTML,JSON \
-                      -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
-                  ''', returnStdout: true).trim()
-                }
-                if (result.contains('BUILD SUCCESS')) {
-                  env.OWASP_STATUS = 'SUCCESS'
-                  try {
-                    def report = new groovy.json.JsonSlurper().parseText(readFile('target/dependency-check-report.json'))
-                    def critical = 0; def high = 0
-                    report.dependencies?.each { dep -> dep.vulnerabilities?.each { v ->
-                      if (v.severity == 'CRITICAL') critical++
-                      if (v.severity == 'HIGH') high++
-                    }}
-                    env.OWASP_CRITICAL = "${critical}"; env.OWASP_HIGH = "${high}"
-                  } catch(e) {}
-                } else {
-                  env.OWASP_STATUS = 'FAILED'; env.OWASP_ERROR = 'Dependency check failed'
+            timestamps {
+              withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+                script {
+                  def result = retry(2) {
+                    sh(script: '''
+                      ./mvnw org.owasp:dependency-check-maven:check \
+                        -DfailBuildOnCVSS=7 \
+                        "-DnvdApiKey=$NVD_API_KEY" \
+                        -Dformats=HTML,JSON \
+                        -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
+                    ''', returnStdout: true).trim()
+                  }
+                  if (result.contains('BUILD SUCCESS')) {
+                    env.OWASP_STATUS = 'SUCCESS'
+                    try {
+                      def report = new groovy.json.JsonSlurper().parseText(readFile('target/dependency-check-report.json'))
+                      def critical = 0; def high = 0
+                      report.dependencies?.each { dep -> dep.vulnerabilities?.each { v ->
+                        if (v.severity == 'CRITICAL') critical++
+                        if (v.severity == 'HIGH') high++
+                      }}
+                      env.OWASP_CRITICAL = "${critical}"; env.OWASP_HIGH = "${high}"
+                    } catch(e) {}
+                  } else {
+                    env.OWASP_STATUS = 'FAILED'; env.OWASP_ERROR = 'Dependency check failed'
+                  }
                 }
               }
             }
@@ -180,35 +177,30 @@ pipeline {
             timeout(time: 15, unit: 'MINUTES')
           }
           steps {
-            script {
-              sh 'docker build -t $DOCKER_IMAGE:$BUILD_NUMBER .'
-              env.DOCKER_BUILD_STATUS = 'SUCCESS'
-              // JF-7 : tracer la version de Trivy utilisee sur l'agent pour la reproductibilite des analyses
-              sh 'trivy --version'
-              retry(2) {
-                sh '''
-                  trivy image --exit-code 0 --severity CRITICAL,HIGH \
-                    --format json --output ${WORKSPACE}/trivy-report.json \
-                    --format table --output ${WORKSPACE}/trivy-report.txt \
-                    $DOCKER_IMAGE:$BUILD_NUMBER 2>&1 || true
-                '''
+            timestamps {
+              script {
+                sh 'docker build -t $DOCKER_IMAGE:$BUILD_NUMBER .'
+                env.DOCKER_BUILD_STATUS = 'SUCCESS'
+                retry(2) {
+                  sh '''
+                    trivy image --exit-code 0 --severity CRITICAL,HIGH \
+                      --format json --output $WORKSPACE/trivy-report.json \
+                      $DOCKER_IMAGE:$BUILD_NUMBER 2>&1 || true
+                  '''
+                }
+                try {
+                  def report = new groovy.json.JsonSlurper().parseText(readFile("${env.WORKSPACE}/trivy-report.json"))
+                  def critical = 0; def high = 0
+                  report.Results?.each { r -> r.Vulnerabilities?.each { v ->
+                    if (v.Severity == 'CRITICAL') critical++
+                    if (v.Severity == 'HIGH') high++
+                  }}
+                  env.TRIVY_CRITICAL = "${critical}"; env.TRIVY_HIGH = "${high}"; env.TRIVY_STATUS = 'SUCCESS'
+                } catch(e) { env.TRIVY_STATUS = 'FAILED'; env.TRIVY_ERROR = "Parse error: ${e.message}" }
               }
-              try {
-                def report = new groovy.json.JsonSlurper().parseText(readFile("${env.WORKSPACE}/trivy-report.json"))
-                def critical = 0; def high = 0
-                report.Results?.each { r -> r.Vulnerabilities?.each { v ->
-                  if (v.Severity == 'CRITICAL') critical++
-                  if (v.Severity == 'HIGH') high++
-                }}
-                env.TRIVY_CRITICAL = "${critical}"; env.TRIVY_HIGH = "${high}"; env.TRIVY_STATUS = 'SUCCESS'
-              } catch(e) { env.TRIVY_STATUS = 'FAILED'; env.TRIVY_ERROR = "Parse error: ${e.message}" }
             }
           }
-          post {
-            always {
-              archiveArtifacts artifacts: 'trivy-report.json, trivy-report.txt', allowEmptyArchive: true
-            }
-          }
+          post { always { archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true } }
         }
 
       }
@@ -220,61 +212,56 @@ pipeline {
         timeout(time: 20, unit: 'MINUTES')
       }
       steps {
-        script {
-          // Les variables ${WORKSPACE}, ${DOCKER_NETWORK}, ${DOCKER_IMAGE}, ${BUILD_NUMBER}
-          // sont expansees par le shell (guillemets simples) et non par Groovy,
-          // garantissant que les valeurs d'environnement Jenkins sont correctement resolues.
-          sh '''
-            mkdir -p ${WORKSPACE}/security/zap
-            docker rm -f vuln-testapp-zap || true
-            docker run -d --name vuln-testapp-zap --network ${DOCKER_NETWORK} ${DOCKER_IMAGE}:${BUILD_NUMBER}
-          '''
-          sh '''
-            echo "Attente du demarrage du conteneur applicatif..."
-            for i in $(seq 1 12); do
-              if curl -sf http://vuln-testapp-zap:8080 > /dev/null 2>&1; then
-                echo "Application disponible."
-                exit 0
-              fi
-              echo "Tentative $i/12 - attente 5s..."
-              sleep 5
-            done
-            echo "Timeout: l application n a pas repondu dans les 60s."
-            exit 1
-          '''
-          retry(2) {
+        timestamps {
+          script {
+            sh 'mkdir -p $WORKSPACE/security/zap'
+            sh 'docker rm -f vuln-testapp-zap || true'
+            sh 'docker run -d --name vuln-testapp-zap --network $DOCKER_NETWORK $DOCKER_IMAGE:$BUILD_NUMBER'
             sh '''
-              docker run --rm \
-                --network ${DOCKER_NETWORK} \
-                -v ${WORKSPACE}/security/zap:/zap/wrk:rw \
-                ghcr.io/zaproxy/zaproxy:2.15.0 \
-                zap-baseline.py \
-                -t http://vuln-testapp-zap:8080 \
-                -r zap-report.html \
-                -J zap-report.json \
-                -I 2>&1 || true
+              echo "Attente du demarrage du conteneur applicatif..."
+              for i in $(seq 1 12); do
+                if curl -sf http://vuln-testapp-zap:8080 > /dev/null 2>&1; then
+                  echo "Application disponible."
+                  exit 0
+                fi
+                echo "Tentative $i/12 - attente 5s..."
+                sleep 5
+              done
+              echo "Timeout: l application n a pas repondu dans les 60s."
+              exit 1
             '''
+            retry(2) {
+              sh '''
+                docker run --rm \
+                  --network $DOCKER_NETWORK \
+                  -v $WORKSPACE/security/zap:/zap/wrk:rw \
+                  ghcr.io/zaproxy/zaproxy:2.15.0 \
+                  zap-baseline.py \
+                  -t http://vuln-testapp-zap:8080 \
+                  -r zap-report.html \
+                  -J zap-report.json \
+                  -I 2>&1 || true
+              '''
+            }
+            try {
+              def zapReport = new groovy.json.JsonSlurper().parseText(readFile("${WORKSPACE}/security/zap/zap-report.json"))
+              def high = 0; def medium = 0; def low = 0
+              zapReport.site?.each { site -> site.alerts?.each { alert ->
+                switch(alert.riskdesc?.split(' ')[0]) {
+                  case 'High':   high++;   break
+                  case 'Medium': medium++; break
+                  case 'Low':    low++;    break
+                }
+              }}
+              env.ZAP_ALERTS_HIGH = "${high}"; env.ZAP_ALERTS_MEDIUM = "${medium}"
+              env.ZAP_ALERTS_LOW = "${low}"; env.ZAP_STATUS = 'SUCCESS'
+            } catch(e) { env.ZAP_STATUS = 'FAILED'; env.ZAP_ERROR = "Parse error: ${e.message}" }
           }
-          try {
-            def zapReport = new groovy.json.JsonSlurper().parseText(readFile("${WORKSPACE}/security/zap/zap-report.json"))
-            def high = 0; def medium = 0; def low = 0
-            zapReport.site?.each { site -> site.alerts?.each { alert ->
-              switch(alert.riskdesc?.split(' ')[0]) {
-                case 'High':   high++;   break
-                case 'Medium': medium++; break
-                case 'Low':    low++;    break
-              }
-            }}
-            env.ZAP_ALERTS_HIGH = "${high}"; env.ZAP_ALERTS_MEDIUM = "${medium}"
-            env.ZAP_ALERTS_LOW = "${low}"; env.ZAP_STATUS = 'SUCCESS'
-          } catch(e) { env.ZAP_STATUS = 'FAILED'; env.ZAP_ERROR = "Parse error: ${e.message}" }
         }
       }
       post {
         always {
           sh 'docker rm -f vuln-testapp-zap || true'
-          // Suppression de l'image Docker apres que ZAP ait termine son analyse
-          sh 'docker rmi $DOCKER_IMAGE:$BUILD_NUMBER || true'
           archiveArtifacts artifacts: 'security/zap/zap-report.json, security/zap/zap-report.html', allowEmptyArchive: true
         }
       }
@@ -287,9 +274,6 @@ pipeline {
         def buildStatus = currentBuild.currentResult
         def event = buildStatus == 'SUCCESS' ? 'pipeline_success' : buildStatus == 'UNSTABLE' ? 'pipeline_unstable' : 'pipeline_failed'
         def severity = buildStatus == 'FAILURE' ? 'HIGH' : buildStatus == 'UNSTABLE' ? 'MEDIUM' : 'LOW'
-        // JF-6 : La cle API n8n est transmise via withCredentials (masquage automatique dans les logs Jenkins).
-        // Le plugin HTTP Request ne doit pas etre configure en mode debug en production
-        // afin d'eviter toute exposition des headers dans les logs.
         withCredentials([string(credentialsId: 'N8N_API_KEY', variable: 'N8N_API_KEY')]) {
           try {
             def payloadMap = [
@@ -369,9 +353,6 @@ pipeline {
         } catch(Exception e) { echo "Backend failed: ${e.message}" }
       }
       cleanWs()
-    }
-    failure {
-      echo 'Pipeline en echec - voir les logs et les rapports archives'
     }
   }
 }
