@@ -3,6 +3,7 @@ pipeline {
   tools { maven 'M3' }
 
   options {
+    timestamps()
     timeout(time: 60, unit: 'MINUTES')
     buildDiscarder(logRotator(numToKeepStr: '10'))
   }
@@ -11,6 +12,8 @@ pipeline {
     PROJECT_ID        = '49bca390-3661-40b1-8f7e-c5dfa3a5cca6'
     SONAR_PROJECT_KEY = 'vuln-testapp'
     SONAR_HOST_URL    = 'http://sonarqube:9000'
+    // URL publique du dashboard SonarQube (IP externe intentionnelle pour acces navigateur)
+    SONAR_DASHBOARD_URL = 'http://172.31.172.61:9000'
     DOCKER_IMAGE      = 'vuln-testapp'
     N8N_WEBHOOK       = 'http://n8n:5678/webhook/jenkins-event'
     BACKEND_URL       = 'http://172.31.172.61:3001'
@@ -44,13 +47,14 @@ pipeline {
     stage('Build Info') {
       steps {
         script {
+          sh 'chmod +x mvnw'
           env.BUILD_VERSION = "${env.BUILD_NUMBER}"
         }
       }
     }
 
     stage('Build') {
-      steps { sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
+      steps { sh './mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
       post {
         success { script { env.COMPILE_STATUS = 'SUCCESS' } }
         failure { script { env.COMPILE_STATUS = 'FAILED' } }
@@ -63,12 +67,12 @@ pipeline {
         withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
           withSonarQubeEnv('sq1') {
             retry(2) {
-              sh """
-                mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \\
-                -Dsonar.projectKey=${env.SONAR_PROJECT_KEY} \\
-                -Dsonar.projectVersion=${env.BUILD_VERSION} \\
+              sh '''
+                ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+                -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+                -Dsonar.projectVersion=$BUILD_VERSION \
                 -Dmaven.repo.local=/var/jenkins_home/.m2/repository
-              """
+              '''
             }
           }
         }
@@ -84,10 +88,17 @@ pipeline {
       }
       steps {
         script {
-          def qg = waitForQualityGate()
-          env.QUALITY_GATE_STATUS = qg.status
           withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
             try {
+              // Recuperation du statut du Quality Gate via l'API SonarQube (sans dependance au webhook)
+              def qgResponse = sh(script: '''
+                curl -s -u "$SONAR_TOKEN": \
+                "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" \
+                2>/dev/null || echo '{}'
+              ''', returnStdout: true).trim()
+              def qgJson = new groovy.json.JsonSlurper().parseText(qgResponse)
+              env.QUALITY_GATE_STATUS = qgJson?.projectStatus?.status ?: 'UNKNOWN'
+
               def sonarMetrics = sh(script: '''
                 curl -s -u "$SONAR_TOKEN": \
                 "$SONAR_HOST_URL/api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
@@ -103,7 +114,7 @@ pipeline {
                   case 'duplicated_lines_density': env.SONAR_DUPLICATIONS = m.value ?: '0'; break
                 }
               }
-            } catch(e) { echo "SonarQube metrics failed: ${e.message}" }
+            } catch(e) { echo "SonarQube quality gate/metrics failed: ${e.message}" }
           }
         }
       }
@@ -122,7 +133,7 @@ pipeline {
               script {
                 def result = retry(2) {
                   sh(script: '''
-                    mvn org.owasp:dependency-check-maven:check \
+                    ./mvnw org.owasp:dependency-check-maven:check \
                       -DfailBuildOnCVSS=7 \
                       "-DnvdApiKey=$NVD_API_KEY" \
                       -Dformats=HTML,JSON \
@@ -156,14 +167,14 @@ pipeline {
           }
           steps {
             script {
-              sh "docker build -t ${DOCKER_IMAGE}:${BUILD_NUMBER} ."
+              sh 'docker build -t $DOCKER_IMAGE:$BUILD_NUMBER .'
               env.DOCKER_BUILD_STATUS = 'SUCCESS'
               retry(2) {
-                sh """
-                  trivy image --exit-code 0 --severity CRITICAL,HIGH \\
-                    --format json --output ${WORKSPACE}/trivy-report.json \\
-                    ${DOCKER_IMAGE}:${BUILD_NUMBER} 2>&1 || true
-                """
+                sh '''
+                  trivy image --exit-code 0 --severity CRITICAL,HIGH \
+                    --format json --output $WORKSPACE/trivy-report.json \
+                    $DOCKER_IMAGE:$BUILD_NUMBER 2>&1 || true
+                '''
               }
               try {
                 def report = new groovy.json.JsonSlurper().parseText(readFile("${env.WORKSPACE}/trivy-report.json"))
@@ -189,8 +200,9 @@ pipeline {
       }
       steps {
         script {
-          sh "mkdir -p ${WORKSPACE}/security/zap"
-          sh "docker run -d --name vuln-testapp-zap --network ${DOCKER_NETWORK} ${DOCKER_IMAGE}:${BUILD_NUMBER}"
+          sh 'mkdir -p $WORKSPACE/security/zap'
+          sh 'docker rm -f vuln-testapp-zap || true'
+          sh 'docker run -d --name vuln-testapp-zap --network $DOCKER_NETWORK $DOCKER_IMAGE:$BUILD_NUMBER'
           sh '''
             echo "Attente du demarrage du conteneur applicatif..."
             for i in $(seq 1 12); do
@@ -204,17 +216,19 @@ pipeline {
             echo "Timeout: l application n a pas repondu dans les 60s."
             exit 1
           '''
-          sh """
-            docker run --rm \\
-              --network ${DOCKER_NETWORK} \\
-              -v ${WORKSPACE}/security/zap:/zap/wrk:rw \\
-              ghcr.io/zaproxy/zaproxy:2.15.0 \\
-              zap-baseline.py \\
-              -t http://vuln-testapp-zap:8080 \\
-              -r zap-report.html \\
-              -J zap-report.json \\
-              -I 2>&1 || true
-          """
+          retry(2) {
+            sh '''
+              docker run --rm \
+                --network $DOCKER_NETWORK \
+                -v $WORKSPACE/security/zap:/zap/wrk:rw \
+                ghcr.io/zaproxy/zaproxy:2.15.0 \
+                zap-baseline.py \
+                -t http://vuln-testapp-zap:8080 \
+                -r zap-report.html \
+                -J zap-report.json \
+                -I 2>&1 || true
+            '''
+          }
           try {
             def zapReport = new groovy.json.JsonSlurper().parseText(readFile("${WORKSPACE}/security/zap/zap-report.json"))
             def high = 0; def medium = 0; def low = 0
@@ -265,8 +279,8 @@ pipeline {
                 code_smells: env.SONAR_SMELLS,
                 coverage: env.SONAR_COVERAGE,
                 duplications: env.SONAR_DUPLICATIONS,
-                dashboard_url: "http://172.31.172.61:9000/dashboard?id=${env.SONAR_PROJECT_KEY}",
-                api_url: "http://sonarqube:9000/api/measures/component?component=${env.SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density"
+                dashboard_url: "${env.SONAR_DASHBOARD_URL}/dashboard?id=${env.SONAR_PROJECT_KEY}",
+                api_url: "${env.SONAR_HOST_URL}/api/measures/component?component=${env.SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density"
               ],
               trivy: [
                 status: env.TRIVY_STATUS,
