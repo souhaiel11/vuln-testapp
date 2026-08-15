@@ -56,7 +56,10 @@ pipeline {
     stage('Build') {
       steps { sh './mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository' }
       post {
-        success { script { env.COMPILE_STATUS = 'SUCCESS' } }
+        success {
+          script { env.COMPILE_STATUS = 'SUCCESS' }
+          archiveArtifacts artifacts: 'target/vuln-testapp-1.0.0.jar', allowEmptyArchive: true
+        }
         failure { script { env.COMPILE_STATUS = 'FAILED' } }
       }
     }
@@ -91,19 +94,23 @@ pipeline {
           withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
             try {
               // Recuperation du statut du Quality Gate via l'API SonarQube (sans dependance au webhook)
-              def qgResponse = sh(script: '''
-                curl -s -u "$SONAR_TOKEN": \
-                "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" \
-                2>/dev/null || echo '{}'
-              ''', returnStdout: true).trim()
+              def qgResponse = retry(2) {
+                sh(script: '''
+                  curl -s --max-time 30 -u "$SONAR_TOKEN": \
+                  "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" \
+                  2>/dev/null || echo '{}'
+                ''', returnStdout: true).trim()
+              }
               def qgJson = new groovy.json.JsonSlurper().parseText(qgResponse)
               env.QUALITY_GATE_STATUS = qgJson?.projectStatus?.status ?: 'UNKNOWN'
 
-              def sonarMetrics = sh(script: '''
-                curl -s -u "$SONAR_TOKEN": \
-                "$SONAR_HOST_URL/api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
-                2>/dev/null || echo '{}'
-              ''', returnStdout: true).trim()
+              def sonarMetrics = retry(2) {
+                sh(script: '''
+                  curl -s --max-time 30 -u "$SONAR_TOKEN": \
+                  "$SONAR_HOST_URL/api/measures/component?component=$SONAR_PROJECT_KEY&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density" \
+                  2>/dev/null || echo '{}'
+                ''', returnStdout: true).trim()
+              }
               def metrics = new groovy.json.JsonSlurper().parseText(sonarMetrics)
               metrics.component?.measures?.each { m ->
                 switch(m.metric) {
@@ -187,7 +194,12 @@ pipeline {
               } catch(e) { env.TRIVY_STATUS = 'FAILED'; env.TRIVY_ERROR = "Parse error: ${e.message}" }
             }
           }
-          post { always { archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true } }
+          post {
+            always {
+              archiveArtifacts artifacts: 'trivy-report.json', allowEmptyArchive: true
+              sh 'docker rmi $DOCKER_IMAGE:$BUILD_NUMBER || true'
+            }
+          }
         }
 
       }
@@ -200,9 +212,11 @@ pipeline {
       }
       steps {
         script {
-          sh 'mkdir -p $WORKSPACE/security/zap'
-          sh 'docker rm -f vuln-testapp-zap || true'
-          sh 'docker run -d --name vuln-testapp-zap --network $DOCKER_NETWORK $DOCKER_IMAGE:$BUILD_NUMBER'
+          sh '''
+            mkdir -p $WORKSPACE/security/zap
+            docker rm -f vuln-testapp-zap || true
+            docker run -d --name vuln-testapp-zap --network $DOCKER_NETWORK $DOCKER_IMAGE:$BUILD_NUMBER
+          '''
           sh '''
             echo "Attente du demarrage du conteneur applicatif..."
             for i in $(seq 1 12); do
