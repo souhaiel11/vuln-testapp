@@ -144,7 +144,7 @@ pipeline {
                     sh(script: '''
                       mvn org.owasp:dependency-check-maven:check \
                         -DfailBuildOnCVSS=7 \
-                        "-DnvdApiKey=$NVD_API_KEY" \
+                        -DnvdApiKey=$NVD_API_KEY \
                         -Dformats=HTML,JSON \
                         -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
                     ''', returnStdout: true).trim()
