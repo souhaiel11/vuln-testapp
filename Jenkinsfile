@@ -67,8 +67,7 @@ pipeline {
     stage('Build') {
       steps {
         timestamps {
-          sh 'chmod +x mvnw'
-          sh './mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+          sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
         }
       }
       post {
@@ -85,7 +84,7 @@ pipeline {
             withSonarQubeEnv('sq1') {
               retry(2) {
                 sh '''
-                  ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+                  mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
                   -Dsonar.projectKey=$SONAR_PROJECT_KEY \
                   -Dsonar.projectVersion=$BUILD_VERSION \
                   -Dmaven.repo.local=/var/jenkins_home/.m2/repository
@@ -154,7 +153,7 @@ pipeline {
                 script {
                   def result = retry(2) {
                     sh(script: '''
-                      ./mvnw org.owasp:dependency-check-maven:check \
+                      mvn org.owasp:dependency-check-maven:check \
                         -DfailBuildOnCVSS=7 \
                         -DnvdApiKey=$NVD_API_KEY \
                         -Dformats=HTML,JSON \
