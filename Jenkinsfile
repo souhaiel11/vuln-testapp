@@ -39,9 +39,6 @@ pipeline {
     ZAP_ALERTS_LOW        = '0'
     ZAP_ERROR             = ''
     DOCKER_BUILD_STATUS   = 'UNKNOWN'
-    BUILD_INFO_STATUS     = 'UNKNOWN'
-    BUILD_INFO_ERROR      = ''
-    REACHED_BUILD_INFO    = 'false'
   }
 
   stages {
@@ -50,15 +47,7 @@ pipeline {
       steps {
         timestamps {
           script {
-            env.REACHED_BUILD_INFO = 'true'
-            try {
-              env.BUILD_VERSION = "${env.BUILD_NUMBER}"
-              env.BUILD_INFO_STATUS = 'SUCCESS'
-            } catch (e) {
-              env.BUILD_INFO_STATUS = 'FAILED'
-              env.BUILD_INFO_ERROR = e.getMessage()
-              throw e
-            }
+            env.BUILD_VERSION = "${env.BUILD_NUMBER}"
           }
         }
       }
@@ -67,7 +56,8 @@ pipeline {
     stage('Build') {
       steps {
         timestamps {
-          sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+          sh 'chmod +x mvnw'
+          sh './mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
         }
       }
       post {
@@ -84,7 +74,7 @@ pipeline {
             withSonarQubeEnv('sq1') {
               retry(2) {
                 sh '''
-                  mvn org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
+                  ./mvnw org.sonarsource.scanner.maven:sonar-maven-plugin:4.0.0.4121:sonar \
                   -Dsonar.projectKey=$SONAR_PROJECT_KEY \
                   -Dsonar.projectVersion=$BUILD_VERSION \
                   -Dmaven.repo.local=/var/jenkins_home/.m2/repository
@@ -153,9 +143,9 @@ pipeline {
                 script {
                   def result = retry(2) {
                     sh(script: '''
-                      mvn org.owasp:dependency-check-maven:check \
+                      ./mvnw org.owasp:dependency-check-maven:check \
                         -DfailBuildOnCVSS=7 \
-                        -DnvdApiKey=$NVD_API_KEY \
+                        "-DnvdApiKey=$NVD_API_KEY" \
                         -Dformats=HTML,JSON \
                         -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
                     ''', returnStdout: true).trim()
@@ -354,24 +344,18 @@ pipeline {
           def failedStage = null
           def errorMessage = null
           if (buildStatus != 'SUCCESS') {
-            if (env.REACHED_BUILD_INFO != 'true') {
-              failedStage = 'Checkout / Installation des outils'
-              errorMessage = "Echec avant le debut des stages du pipeline (checkout du depot ou installation d'un tool Jenkins comme Maven M3) - voir la console Jenkins : ${env.BUILD_URL}console"
-            } else {
-              def stageChecks = [
-                ['Build Info',           env.BUILD_INFO_STATUS,   env.BUILD_INFO_ERROR],
-                ['Build',                env.COMPILE_STATUS,      null],
-                ['SAST - SonarQube',     env.SONAR_STATUS,        null],
-                ['SCA - OWASP',          env.OWASP_STATUS,        env.OWASP_ERROR],
-                ['Docker Build & Trivy', env.DOCKER_BUILD_STATUS, env.TRIVY_ERROR],
-                ['DAST - ZAP',           env.ZAP_STATUS,          env.ZAP_ERROR],
-              ]
-              for (chk in stageChecks) {
-                if (chk[1] != 'SUCCESS') {
-                  failedStage = chk[0]
-                  errorMessage = chk[2] ?: "${chk[0]} a echoue (voir logs Jenkins : ${env.BUILD_URL}console)."
-                  break
-                }
+            def stageChecks = [
+              ['Build',                env.COMPILE_STATUS,      null],
+              ['SAST - SonarQube',     env.SONAR_STATUS,        null],
+              ['SCA - OWASP',          env.OWASP_STATUS,        env.OWASP_ERROR],
+              ['Docker Build & Trivy', env.DOCKER_BUILD_STATUS, env.TRIVY_ERROR],
+              ['DAST - ZAP',           env.ZAP_STATUS,          env.ZAP_ERROR],
+            ]
+            for (chk in stageChecks) {
+              if (chk[1] != 'SUCCESS') {
+                failedStage = chk[0]
+                errorMessage = chk[2] ?: "${chk[0]} a echoue (voir logs Jenkins : ${env.BUILD_URL}console)."
+                break
               }
             }
           }
