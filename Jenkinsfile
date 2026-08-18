@@ -149,31 +149,43 @@ pipeline {
           }
           steps {
             timestamps {
-              withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
-                script {
-                  def result = retry(2) {
-                    sh(script: '''
-                      mvn org.owasp:dependency-check-maven:check \
-                        -DfailBuildOnCVSS=7 \
+              script {
+                // Étape 1 : mise à jour de la base NVD (best-effort, jamais fatale — credential manquant inclus)
+                try {
+                  withCredentials([string(credentialsId: 'NVD_API_KEY', variable: 'NVD_API_KEY')]) {
+                    sh '''
+                      mvn org.owasp:dependency-check-maven:update-only \
                         -DnvdApiKey=$NVD_API_KEY \
-                        -Dformats=HTML,JSON \
                         -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
-                    ''', returnStdout: true).trim()
+                    '''
                   }
-                  if (result.contains('BUILD SUCCESS')) {
-                    env.OWASP_STATUS = 'SUCCESS'
-                    try {
-                      def report = new groovy.json.JsonSlurper().parseText(readFile('target/dependency-check-report.json'))
-                      def critical = 0; def high = 0
-                      report.dependencies?.each { dep -> dep.vulnerabilities?.each { v ->
-                        if (v.severity == 'CRITICAL') critical++
-                        if (v.severity == 'HIGH') high++
-                      }}
-                      env.OWASP_CRITICAL = "${critical}"; env.OWASP_HIGH = "${high}"
-                    } catch(e) {}
-                  } else {
-                    env.OWASP_STATUS = 'FAILED'; env.OWASP_ERROR = 'Dependency check failed'
-                  }
+                } catch (e) {
+                  echo "OWASP update-only non disponible (${e.message}) — poursuite avec le cache NVD existant"
+                }
+
+                // Étape 2 : analyse des dépendances, découplée du réseau et de la clé NVD
+                def result = retry(2) {
+                  sh(script: '''
+                    mvn org.owasp:dependency-check-maven:check \
+                      -DautoUpdate=false \
+                      -DfailBuildOnCVSS=7 \
+                      -Dformats=HTML,JSON \
+                      -Dmaven.repo.local=/var/jenkins_home/.m2/repository 2>&1 || true
+                  ''', returnStdout: true).trim()
+                }
+                if (result.contains('BUILD SUCCESS')) {
+                  env.OWASP_STATUS = 'SUCCESS'
+                  try {
+                    def report = new groovy.json.JsonSlurper().parseText(readFile('target/dependency-check-report.json'))
+                    def critical = 0; def high = 0
+                    report.dependencies?.each { dep -> dep.vulnerabilities?.each { v ->
+                      if (v.severity == 'CRITICAL') critical++
+                      if (v.severity == 'HIGH') high++
+                    }}
+                    env.OWASP_CRITICAL = "${critical}"; env.OWASP_HIGH = "${high}"
+                  } catch(e) {}
+                } else {
+                  env.OWASP_STATUS = 'FAILED'; env.OWASP_ERROR = 'Dependency check failed'
                 }
               }
             }
