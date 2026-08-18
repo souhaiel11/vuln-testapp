@@ -67,7 +67,7 @@ pipeline {
     stage('Build') {
       steps {
         timestamps {
-          sh 'mvn clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
+          sh 'chmod +x mvnw && ./mvnw clean package -DskipTests -q -Dmaven.repo.local=/var/jenkins_home/.m2/repository'
         }
       }
       post {
