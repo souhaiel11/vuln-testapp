@@ -38,6 +38,12 @@ pipeline {
     ZAP_ALERTS_MEDIUM     = '0'
     ZAP_ALERTS_LOW        = '0'
     ZAP_ERROR             = ''
+    ZAP_EXECUTED          = 'false'
+    ZAP_ROOT_CAUSE        = 'UNKNOWN'
+    ZAP_TARGET_URL        = 'http://vuln-testapp-zap:8080'
+    ZAP_EXPECTED_PORT     = '8080'
+    ZAP_DIAGNOSTIC_PATH   = ''
+    ZAP_TECHNICAL_EVIDENCE = ''
     DOCKER_BUILD_STATUS   = 'UNKNOWN'
     BUILD_INFO_STATUS     = 'UNKNOWN'
     BUILD_INFO_ERROR      = ''
@@ -239,10 +245,10 @@ pipeline {
             sh 'mkdir -p $WORKSPACE/security/zap'
             sh 'docker rm -f vuln-testapp-zap || true'
             sh 'docker run -d --name vuln-testapp-zap --network $DOCKER_NETWORK $DOCKER_IMAGE:$BUILD_NUMBER'
-            sh '''
+            def readinessStatus = sh(returnStatus: true, script: '''
               echo "Attente du demarrage du conteneur applicatif..."
               for i in $(seq 1 12); do
-                if curl -sf http://vuln-testapp-zap:8080 > /dev/null 2>&1; then
+                if curl -sf "$ZAP_TARGET_URL" > /dev/null 2>&1; then
                   echo "Application disponible."
                   exit 0
                 fi
@@ -251,7 +257,50 @@ pipeline {
               done
               echo "Timeout: l application n a pas repondu dans les 60s."
               exit 1
-            '''
+            ''')
+            if (readinessStatus != 0) {
+              // Capture BEFORE cleanup: never lose the application failure
+              // evidence merely because ZAP could not start.
+              def inspectRaw = sh(returnStdout: true, script: "docker inspect vuln-testapp-zap 2>/dev/null || echo '[]'").trim()
+              def inspectList = new groovy.json.JsonSlurper().parseText(inspectRaw)
+              def inspected = inspectList ? inspectList[0] : [:]
+              def rawLogs = sh(returnStdout: true, script: 'docker logs --tail 250 vuln-testapp-zap 2>&1 || true').trim()
+              def sanitizedLogs = rawLogs.replaceAll(/(?i)(password|token|secret|api[_-]?key)(\s*[=:]\s*)\S+/) { all, key, separator ->
+                "${key}${separator}[REDACTED]"
+              }
+              def evidenceLines = sanitizedLogs.readLines().findAll { line ->
+                line ==~ /(?i).*\b(caused by|exception|error|failed)\b.*/
+              }
+              def technicalEvidence = evidenceLines.takeRight(8).join(' | ').take(2000)
+              def running = inspected?.State?.Running == true
+              def exitCode = inspected?.State?.ExitCode
+              def health = inspected?.State?.Health?.Status
+              def networks = inspected?.NetworkSettings?.Networks?.keySet()?.toList() ?: []
+              def category = (!running && exitCode != null && exitCode != 0) ? 'APPLICATION_DEFECT' : 'UNKNOWN'
+              def message = running
+                ? "Application container remained running but did not answer on the configured target"
+                : "Application container exited before readiness (exit code ${exitCode})"
+              def diagnostic = [
+                scanner: 'ZAP', state: 'TARGET_UNAVAILABLE', executed: false,
+                targetUrl: env.ZAP_TARGET_URL, containerName: 'vuln-testapp-zap',
+                containerRunning: running, exitCode: exitCode, healthStatus: health,
+                expectedPort: env.ZAP_EXPECTED_PORT as Integer, network: env.DOCKER_NETWORK,
+                networkMembership: networks, readinessAttempts: 12, timeoutSeconds: 60,
+                rootCauseCategory: category, technicalMessage: message,
+                technicalEvidence: technicalEvidence, logsCaptured: true
+              ]
+              writeFile file: 'security/zap/zap-target-diagnostic.json',
+                text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(diagnostic))
+              writeFile file: 'security/zap/zap-target-application.log', text: sanitizedLogs + '\n'
+              env.ZAP_STATUS = 'TARGET_UNAVAILABLE'
+              env.ZAP_EXECUTED = 'false'
+              env.ZAP_ROOT_CAUSE = category
+              env.ZAP_DIAGNOSTIC_PATH = 'security/zap/zap-target-diagnostic.json'
+              env.ZAP_TECHNICAL_EVIDENCE = technicalEvidence
+              env.ZAP_ERROR = message
+              error("ZAP target unavailable; diagnostic evidence captured")
+            }
+            env.ZAP_EXECUTED = 'true'
             retry(2) {
               sh '''
                 docker run --rm \
@@ -259,7 +308,7 @@ pipeline {
                   -v $WORKSPACE/security/zap:/zap/wrk:rw \
                   ghcr.io/zaproxy/zaproxy:2.15.0 \
                   zap-baseline.py \
-                  -t http://vuln-testapp-zap:8080 \
+                  -t "$ZAP_TARGET_URL" \
                   -r zap-report.html \
                   -J zap-report.json \
                   -I 2>&1 || true
@@ -283,8 +332,8 @@ pipeline {
       }
       post {
         always {
+          archiveArtifacts artifacts: 'security/zap/zap-report.json, security/zap/zap-report.html, security/zap/zap-target-diagnostic.json, security/zap/zap-target-application.log', allowEmptyArchive: true
           sh 'docker rm -f vuln-testapp-zap || true'
-          archiveArtifacts artifacts: 'security/zap/zap-report.json, security/zap/zap-report.html', allowEmptyArchive: true
         }
       }
     }
@@ -336,7 +385,15 @@ pipeline {
               ],
               zap: [
                 status: env.ZAP_STATUS,
+                state: env.ZAP_STATUS,
+                executed: env.ZAP_EXECUTED == 'true',
                 error: env.ZAP_ERROR,
+                target_url: env.ZAP_TARGET_URL,
+                expected_port: env.ZAP_EXPECTED_PORT as Integer,
+                root_cause_category: env.ZAP_ROOT_CAUSE,
+                technical_evidence: env.ZAP_TECHNICAL_EVIDENCE,
+                diagnostic_path: env.ZAP_DIAGNOSTIC_PATH,
+                diagnostic_url: env.ZAP_DIAGNOSTIC_PATH ? "${env.BUILD_URL}artifact/${env.ZAP_DIAGNOSTIC_PATH}" : '',
                 alerts_high: env.ZAP_ALERTS_HIGH,
                 alerts_medium: env.ZAP_ALERTS_MEDIUM,
                 alerts_low: env.ZAP_ALERTS_LOW,
