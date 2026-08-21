@@ -1,3 +1,15 @@
+@NonCPS
+def toSerializableJson(obj) {
+  if (obj instanceof Map) {
+    def m = [:]
+    obj.each { k, v -> m[k] = toSerializableJson(v) }
+    return m
+  } else if (obj instanceof List) {
+    return obj.collect { toSerializableJson(it) }
+  }
+  return obj
+}
+
 pipeline {
   agent any
   tools { maven 'M3' }
@@ -262,7 +274,7 @@ pipeline {
               // Capture BEFORE cleanup: never lose the application failure
               // evidence merely because ZAP could not start.
               def inspectRaw = sh(returnStdout: true, script: "docker inspect vuln-testapp-zap 2>/dev/null || echo '[]'").trim()
-              def inspectList = new groovy.json.JsonSlurper().parseText(inspectRaw)
+              def inspectList = toSerializableJson(new groovy.json.JsonSlurper().parseText(inspectRaw))
               def inspected = inspectList ? inspectList[0] : [:]
               def rawLogs = sh(returnStdout: true, script: 'docker logs --tail 250 vuln-testapp-zap 2>&1 || true').trim()
               def sanitizedLogs = rawLogs.replaceAll(/(?i)(password|token|secret|api[_-]?key)(\s*[=:]\s*)\S+/) { all, key, separator ->
@@ -315,7 +327,7 @@ pipeline {
               '''
             }
             try {
-              def zapReport = new groovy.json.JsonSlurper().parseText(readFile("${WORKSPACE}/security/zap/zap-report.json"))
+              def zapReport = toSerializableJson(new groovy.json.JsonSlurper().parseText(readFile("${WORKSPACE}/security/zap/zap-report.json")))
               def high = 0; def medium = 0; def low = 0
               zapReport.site?.each { site -> site.alerts?.each { alert ->
                 switch(alert.riskdesc?.split(' ')[0]) {
